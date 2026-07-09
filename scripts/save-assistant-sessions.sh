@@ -1399,12 +1399,54 @@ main() {
 
 	log "saved $count assistant session(s) to $OUTPUT_FILE"
 
+	# The sidecar is overwritten in place on every save, so a save that fires
+	# at the wrong moment (e.g. mid-restore, before assistants have been
+	# replayed) destroys the only copy of the pane→session mapping — fresh
+	# sessions have no --resume arg in their pane command line, making the
+	# sidecar the sole durable record. Keeping a bounded history turns that
+	# loss into a one-file rollback.
+	archive_sidecar_history
+
 	# Strip captured pane contents for assistant panes so tmux-resurrect
 	# won't restore stale TUI output that the post-restore hook would
 	# immediately replace. Non-assistant pane contents are preserved.
 	if [ "$count" -gt 0 ]; then
 		strip_assistant_pane_contents
 	fi
+}
+
+# Archive one timestamped copy of the sidecar per distinct state under
+# $RESURRECT_DIR/assistant-sessions-history/, bounded to the newest
+# @assistant-resurrect-sidecar-history entries (default 100; 0 disables).
+# The sidecar's .timestamp field changes on every save, so dedup compares
+# the document with that field stripped; pid churn (assistant restarts)
+# deliberately counts as a new state. Recovery:
+#   cp assistant-sessions-history/<pick>.json assistant-sessions.json
+#   bash scripts/restore-assistant-sessions.sh
+archive_sidecar_history() {
+	local limit
+	limit=$(tmux show-option -gqv @assistant-resurrect-sidecar-history 2>/dev/null || true)
+	case "$limit" in '' | *[!0-9]*) limit=100 ;; esac
+	[ "$limit" -eq 0 ] && return 0
+	[ -f "$OUTPUT_FILE" ] || return 0
+
+	local hist_dir="$RESURRECT_DIR/assistant-sessions-history"
+	mkdir -p "$hist_dir" 2>/dev/null || return 0
+
+	# Skip if nothing but the save timestamp changed since the newest copy
+	local newest
+	newest=$(ls -t "$hist_dir"/assistant-sessions-*.json 2>/dev/null | head -1 || true)
+	if [ -n "$newest" ] &&
+		[ "$(jq -S 'del(.timestamp)' "$OUTPUT_FILE" 2>/dev/null)" = "$(jq -S 'del(.timestamp)' "$newest" 2>/dev/null)" ]; then
+		return 0
+	fi
+
+	cp "$OUTPUT_FILE" "$hist_dir/assistant-sessions-$(date -u +%Y%m%dT%H%M%S).json" 2>/dev/null || return 0
+
+	# Prune oldest copies beyond the limit
+	ls -t "$hist_dir"/assistant-sessions-*.json 2>/dev/null | tail -n +$((limit + 1)) | while IFS= read -r f; do
+		rm -f "$f"
+	done
 }
 
 # Remove assistant pane entries from tmux-resurrect's pane_contents.tar.gz.

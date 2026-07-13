@@ -202,40 +202,41 @@ restore_one() {
 	fi
 
 	local resume_cmd=""
+	local assistant_env="env -u NO_COLOR"
 	case "$tool" in
 	claude)
 		if [ -n "$safe_cli_args" ] || [ -n "$safe_model_arg" ]; then
-			resume_cmd="command claude${safe_cli_args}${safe_model_arg} --resume ${safe_sid}"
+			resume_cmd="${assistant_env} claude${safe_cli_args}${safe_model_arg} --resume ${safe_sid}"
 		else
-			resume_cmd="command claude --resume ${safe_sid}"
+			resume_cmd="${assistant_env} claude --resume ${safe_sid}"
 		fi
 		;;
 	opencode)
 		if [ -n "$safe_cli_args" ]; then
-			resume_cmd="command opencode${safe_cli_args} -s ${safe_sid}"
+			resume_cmd="${assistant_env} opencode${safe_cli_args} -s ${safe_sid}"
 		else
-			resume_cmd="command opencode -s ${safe_sid}"
+			resume_cmd="${assistant_env} opencode -s ${safe_sid}"
 		fi
 		;;
 	codex)
 		if [ -n "$safe_cli_args" ]; then
-			resume_cmd="command codex${safe_cli_args} resume ${safe_sid}"
+			resume_cmd="${assistant_env} codex${safe_cli_args} resume ${safe_sid}"
 		else
-			resume_cmd="command codex resume ${safe_sid}"
+			resume_cmd="${assistant_env} codex resume ${safe_sid}"
 		fi
 		;;
 	pi)
 		if [ -n "$safe_cli_args" ]; then
-			resume_cmd="command pi${safe_cli_args} --session ${safe_sid}"
+			resume_cmd="${assistant_env} pi${safe_cli_args} --session ${safe_sid}"
 		else
-			resume_cmd="command pi --session ${safe_sid}"
+			resume_cmd="${assistant_env} pi --session ${safe_sid}"
 		fi
 		;;
 	omp)
 		if [ -n "$safe_cli_args" ]; then
-			resume_cmd="command omp${safe_cli_args} --resume ${safe_sid}"
+			resume_cmd="${assistant_env} omp${safe_cli_args} --resume ${safe_sid}"
 		else
-			resume_cmd="command omp --resume ${safe_sid}"
+			resume_cmd="${assistant_env} omp --resume ${safe_sid}"
 		fi
 		;;
 	grok)
@@ -245,7 +246,7 @@ restore_one() {
 		# stale prompt into the resumed session. A clean `grok --resume <id>`
 		# is the correct restore. The generic cwd `cd` below still runs first,
 		# which also lets grok locate the (cwd-scoped) session directory.
-		resume_cmd="command grok --resume ${safe_sid}"
+		resume_cmd="${assistant_env} grok --resume ${safe_sid}"
 		;;
 	*)
 		log "unknown tool '$tool' for pane $pane, skipping"

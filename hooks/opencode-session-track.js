@@ -7,7 +7,7 @@
 // Install: symlink into ~/.config/opencode/plugins/ (global) or .opencode/plugins/ (project).
 
 import { writeFileSync, mkdirSync, unlinkSync } from "fs";
-import { execSync } from "child_process";
+import { execFileSync, execSync } from "child_process";
 import { tmpdir } from "os";
 
 export const SessionTracker = async ({ client, directory }) => {
@@ -19,6 +19,7 @@ export const SessionTracker = async ({ client, directory }) => {
   // finds via `ps` tree walk.
   const pid = process.pid;
   const stateFile = `${stateDir}/opencode-${pid}.json`;
+  const topLevelSessionIDs = new Set();
 
   mkdirSync(stateDir, { recursive: true, mode: 0o700 });
 
@@ -61,10 +62,19 @@ export const SessionTracker = async ({ client, directory }) => {
     process.exit(0);
   });
 
-  const writeSessionFile = (event) => {
+  const topLevelSession = (event) => {
     const sessionInfo = event.properties?.info || {};
-    const sessionID = sessionInfo.id || event.properties?.id;
-    if (!sessionID) return;
+    const sessionID = sessionInfo.id || event.properties?.sessionID || event.properties?.id;
+    if (!sessionID || sessionInfo.parentID || sessionInfo.parent_id) return;
+    if (Object.keys(sessionInfo).length > 0) topLevelSessionIDs.add(sessionID);
+    if (!topLevelSessionIDs.has(sessionID)) return;
+    return { sessionID, sessionInfo };
+  };
+
+  const writeSessionFile = (event) => {
+    const session = topLevelSession(event);
+    if (!session) return;
+    const { sessionID, sessionInfo } = session;
 
     // Build env object: always capture TMUX_PANE and SHELL, plus user-configured vars
     const env = {
@@ -97,15 +107,41 @@ export const SessionTracker = async ({ client, directory }) => {
     }
   };
 
+  const recordChatEvent = (event, lifecycle) => {
+    if (!process.env.TMUX_PANE) return;
+    const session = topLevelSession(event);
+    if (!session) return;
+    const { sessionID, sessionInfo } = session;
+    try {
+      execFileSync("agentmux", ["chat-event", "opencode", lifecycle], {
+        input: JSON.stringify({
+          session_id: sessionID,
+          cwd: sessionInfo.directory || directory || process.cwd(),
+          title: sessionInfo.title || "",
+          timestamp: new Date().toISOString(),
+          session: sessionInfo,
+        }),
+        stdio: ["pipe", "ignore", "ignore"],
+        timeout: 2000,
+      });
+    } catch {
+      // History is optional and must never interrupt OpenCode.
+    }
+  };
+
   return {
     event: async ({ event }) => {
-      const sessionEvents = [
-        "session.created",
-        "session.updated",
-        "session.idle",
-      ];
+      const sessionEvents = ["session.created", "session.updated", "session.idle"];
       if (sessionEvents.includes(event.type)) {
         writeSessionFile(event);
+        recordChatEvent(event, event.type === "session.created" ? "start" : "seen");
+      } else if (event.type === "session.deleted") {
+        recordChatEvent(event, "end");
+        topLevelSessionIDs.delete(
+          event.properties?.info?.id ||
+            event.properties?.sessionID ||
+            event.properties?.id,
+        );
       }
     },
   };

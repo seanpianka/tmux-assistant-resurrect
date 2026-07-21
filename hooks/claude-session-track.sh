@@ -52,3 +52,7 @@ if ! echo "$INPUT" | jq \
 	>"$STATE_FILE" 2>/dev/null; then
 	echo "tmux-assistant-resurrect: failed to write state file $STATE_FILE (permission denied?)" >&2
 fi
+
+if [ -n "${TMUX_PANE:-}" ] && command -v agentmux >/dev/null 2>&1; then
+	printf '%s' "$INPUT" | agentmux chat-event claude start >/dev/null 2>&1 || true
+fi

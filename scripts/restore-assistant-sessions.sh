@@ -11,6 +11,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-detect.sh
 source "$SCRIPT_DIR/lib-detect.sh"
+# shellcheck source=lib-codex-session.sh
+source "$SCRIPT_DIR/lib-codex-session.sh"
 
 # Follow tmux-resurrect's own save-dir resolution (resurrect_data_dir in
 # lib-detect.sh) so we read the sidecar from wherever resurrect saved it.
@@ -102,7 +104,7 @@ fi
 # writes stay atomic) and its own $results_dir/<idx> success marker.
 restore_one() {
 	local entry="$1" idx="$2"
-	local pane tool session_id cwd cli_args model env_json
+	local pane tool session_id cwd cli_args model env_json restore_mode thread_kind
 	pane=$(echo "$entry" | jq -r '.pane')
 	tool=$(echo "$entry" | jq -r '.tool')
 	session_id=$(echo "$entry" | jq -r '.session_id')
@@ -110,6 +112,28 @@ restore_one() {
 	cli_args=$(echo "$entry" | jq -r '.cli_args // empty')
 	model=$(echo "$entry" | jq -r '.model // empty')
 	env_json=$(echo "$entry" | jq -c '.env // {}')
+	restore_mode=$(echo "$entry" | jq -r '.restore_mode // empty')
+	thread_kind=$(echo "$entry" | jq -r '.thread_kind // empty')
+
+	# Old sidecars did not distinguish user threads from subagents. Classify
+	# them from Codex state where possible and fail closed to the native picker
+	# for child, Guardian, unknown, or otherwise ambiguous identities.
+	if [ "$tool" = "codex" ]; then
+		if [ -z "$restore_mode" ] || [ -z "$thread_kind" ]; then
+			local legacy_record us=$'\x1f'
+			legacy_record=$(codex_thread_kind_from_id "$session_id")
+			thread_kind="${legacy_record%%"$us"*}"
+			if [ "$thread_kind" = "parent" ]; then
+				restore_mode="exact"
+			else
+				restore_mode="picker"
+			fi
+		fi
+		case "$restore_mode:$thread_kind" in
+		exact:parent | exact:subagent | picker:*) ;;
+		*) restore_mode="picker" ;;
+		esac
+	fi
 
 	# Check if the target pane's session exists
 	local tmux_session="${pane%%:*}"
@@ -219,7 +243,9 @@ restore_one() {
 		fi
 		;;
 	codex)
-		if [ -n "$safe_cli_args" ]; then
+		if [ "$restore_mode" = "picker" ]; then
+			resume_cmd="${assistant_env} codex${safe_cli_args} resume"
+		elif [ -n "$safe_cli_args" ]; then
 			resume_cmd="${assistant_env} codex${safe_cli_args} resume ${safe_sid}"
 		else
 			resume_cmd="${assistant_env} codex resume ${safe_sid}"
@@ -259,7 +285,11 @@ restore_one() {
 		resume_cmd="${env_prefix}${resume_cmd}"
 	fi
 
-	log "restoring $tool in $pane (session: $session_id, cmd: $resume_cmd)"
+	if [ "$tool" = "codex" ] && [ "$restore_mode" = "picker" ]; then
+		log "restoring codex in $pane via native picker (cmd: $resume_cmd)"
+	else
+		log "restoring $tool in $pane (session: $session_id, cmd: $resume_cmd)"
+	fi
 
 	# Clear the pane before launching: tmux-resurrect may have restored old
 	# pane contents (captured terminal text from the previous session). Without

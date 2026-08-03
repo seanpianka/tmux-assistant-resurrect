@@ -27,8 +27,13 @@ fi
 
 BENCH_ROOT=$(mktemp -d)
 cleanup() {
+	pkill -f "$BENCH_ROOT/bin/claude" >/dev/null 2>&1 || true
 	tmux kill-server >/dev/null 2>&1 || true
-	rm -rf "$BENCH_ROOT"
+	sleep 0.1
+	for _ in 1 2 3; do
+		rm -rf "$BENCH_ROOT" 2>/dev/null && return
+		sleep 0.1
+	done
 }
 trap cleanup EXIT
 
@@ -40,6 +45,10 @@ mkdir -p "$HOME/.tmux/resurrect" "$TMUX_TMPDIR" "$TMUX_ASSISTANT_RESURRECT_DIR" 
 # Mock claude binary so we can create many assistant processes without network/API keys.
 cat >"$BENCH_ROOT/bin/claude" <<'SH'
 #!/usr/bin/env bash
+if [ "${1:-}" = "--help" ]; then
+	printf '%s\n' '  --resume <session-id>' '  --continue'
+	exit 0
+fi
 sleep 600
 SH
 chmod +x "$BENCH_ROOT/bin/claude"
@@ -63,7 +72,7 @@ echo "runs=$RUNS panes=$PANES assistants=$ASSISTANTS"
 TIMES_FILE="$BENCH_ROOT/times.txt"
 : >"$TIMES_FILE"
 for r in $(seq 1 "$RUNS"); do
-	t=$((TIMEFORMAT=%3R; time bash "$REPO_PATH/scripts/save-assistant-sessions.sh" >/dev/null 2>&1) 2>&1)
+	t=$(TIMEFORMAT=%3R; { time bash "$REPO_PATH/scripts/save-assistant-sessions.sh" >/dev/null 2>&1; } 2>&1)
 	echo "$t" >>"$TIMES_FILE"
 	printf 'run_%02d=%s\n' "$r" "$t"
 done

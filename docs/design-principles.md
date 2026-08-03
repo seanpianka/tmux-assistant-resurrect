@@ -36,8 +36,12 @@ before hooks/plugins have fired):
   state file (fallback for runtime session switches); SQLite database query
   at `~/.local/share/opencode/opencode.db` matching the pane's cwd (version-
   resilient fallback when the plugin hasn't fired)
-- **Codex CLI**: PID lookup in `~/.codex/session-tags.jsonl` (primary);
-  `resume <id>` in process args (fallback)
+- **Codex CLI**: open rollout descriptors owned by each Codex PID, joined to
+  `~/.codex/state_*.sqlite` (primary); verified PID tags, explicit parent IDs,
+  a previously verified pane parent, or a unique cwd parent (fallbacks).
+  Parent rollouts outrank subagents and Guardians. Ambiguity opens the native
+  picker; a direct child is exact only when it is the sole open rollout and the
+  running command explicitly names it.
 - **Pi**: `--session <id>` in process args (fallback); session header lookup in
   `~/.pi/agent/sessions/--<cwd>--/*.jsonl` (primary for fresh sessions)
 - **Oh My Pi**: `--resume <id>` / `-r <id>` in process args (fallback);
@@ -68,8 +72,9 @@ To add support for a new tool:
   `process.title = 'claude'`. This means `--resume <id>` is NOT visible in
   `ps` output -- the state file from the `SessionStart` hook is the only
   reliable source of session IDs for Claude.
-- **Codex CLI** runs via Node.js and preserves its full command line in `ps`,
-  so `codex resume <id>` is always visible.
+- **Codex CLI** may expose a resume ID in `ps`, but that alone is insufficient
+  for a subagent. `lib-codex-session.sh` verifies process-owned rollouts and
+  classifies `threads.thread_source` / `threads.source` before exact restore.
 - **OpenCode** is a native Go binary (distributed via npm as `opencode-ai`
   or installed via `opencode upgrade`). Like Claude, the Go binary overwrites
   its process title, so `-s <id>` is NOT visible in `ps`. The plugin state

@@ -354,6 +354,10 @@ EOF
 codex_child_pid=$(ps -eo pid=,ppid=,args= | awk -v ppid="$codex_pane_shell_pid" '$2 == ppid && /codex/ {print $1; exit}')
 mkdir -p "$HOME/.codex"
 echo "{\"pid\": ${codex_child_pid}, \"session\": \"ses_codex_test_789\", \"host\": \"test\", \"started_at\": \"2026-01-01T00:00:00Z\"}" >"$HOME/.codex/session-tags.jsonl"
+mkdir -p "$HOME/.codex/sessions/test"
+cat >"$HOME/.codex/sessions/test/rollout-ses_codex_test_789.jsonl" <<'JSON'
+{"type":"session_meta","payload":{"id":"ses_codex_test_789","cwd":"/tmp","source":"cli","thread_source":"user"}}
+JSON
 
 # Create a Pi session file in the cwd-scoped sessions directory
 pi_sid="019e99pi-test-0001"
@@ -536,12 +540,48 @@ assert_contains "Restore sent pi --session" "$restore_log_content" "$pi_sid"
 assert_contains "Restore sent omp session ID" "$omp_restore_line" "$omp_sid"
 assert_contains "Restore sent omp --resume" "$omp_restore_line" "--resume"
 
-# Verify restore uses 'command' prefix to bypass shell aliases
-assert_contains "Restore uses 'command claude' prefix" "$restore_log_content" "command claude"
-assert_contains "Restore uses 'command opencode' prefix" "$restore_log_content" "command opencode"
-assert_contains "Restore uses 'command codex' prefix" "$restore_log_content" "command codex"
-assert_contains "Restore uses 'command pi' prefix" "$restore_log_content" "command pi"
-assert_contains "Restore uses 'command omp' prefix" "$omp_restore_line" "command omp"
+# Verify restore clears inherited NO_COLOR before each assistant TUI starts.
+assert_contains "Restore clears NO_COLOR for claude" "$restore_log_content" "env -u NO_COLOR claude"
+assert_contains "Restore clears NO_COLOR for opencode" "$restore_log_content" "env -u NO_COLOR opencode"
+assert_contains "Restore clears NO_COLOR for codex" "$restore_log_content" "env -u NO_COLOR codex"
+assert_contains "Restore clears NO_COLOR for pi" "$restore_log_content" "env -u NO_COLOR pi"
+assert_contains "Restore clears NO_COLOR for omp" "$omp_restore_line" "env -u NO_COLOR omp"
+
+# Legacy child/Guardian IDs are unsafe because old sidecars did not record why
+# the child was selected. They must open Codex's native picker. A new sidecar
+# may still restore an explicitly proven sole direct child exactly.
+echo ""
+echo "=== Test 3a: Codex parent-safe restore policy ==="
+echo ""
+
+tmux new-session -d -s test-codex-picker -c /tmp
+tmux split-window -d -t test-codex-picker -c /tmp
+tmux split-window -d -t test-codex-picker -c /tmp
+tmux split-window -d -t test-codex-picker -c /tmp
+cat >"$HOME/.codex/sessions/test/rollout-legacy_child.jsonl" <<'JSON'
+{"type":"session_meta","payload":{"id":"legacy_child","cwd":"/tmp","source":{"subagent":{"thread_spawn":{"parent_thread_id":"parent"}}},"thread_source":"subagent"}}
+JSON
+cat >"$HOME/.codex/sessions/test/rollout-legacy_guardian.jsonl" <<'JSON'
+{"type":"session_meta","payload":{"id":"legacy_guardian","cwd":"/tmp","source":{"subagent":{"other":"guardian"}},"thread_source":"subagent"}}
+JSON
+cp "$SAVED" "${SAVED}.before-codex-policy"
+cat >"$SAVED" <<'JSON'
+{"timestamp":"2026-08-03T00:00:00Z","sessions":[
+ {"pane":"test-codex-picker:0.0","tool":"codex","session_id":"legacy_child","cwd":"/tmp"},
+ {"pane":"test-codex-picker:0.1","tool":"codex","session_id":"legacy_guardian","cwd":"/tmp"},
+ {"pane":"test-codex-picker:0.2","tool":"codex","session_id":"","cwd":"/tmp","restore_mode":"picker","thread_kind":"unknown"},
+ {"pane":"test-codex-picker:0.3","tool":"codex","session_id":"direct_child","cwd":"/tmp","restore_mode":"exact","thread_kind":"subagent"}
+]}
+JSON
+: >"$RESTORE_LOG"
+bash "$REPO_DIR/scripts/restore-assistant-sessions.sh"
+picker_policy_log=$(cat "$RESTORE_LOG")
+assert_eq "Legacy child, Guardian, and ambiguity use picker" "3" "$(grep -c 'via native picker' "$RESTORE_LOG")"
+assert_contains "Explicit sole direct child restores exactly" "$picker_policy_log" "codex resume 'direct_child'"
+assert_eq "Legacy child ID is not resumed exactly" "0" "$(grep -c "codex resume 'legacy_child'" "$RESTORE_LOG" || true)"
+assert_eq "Legacy Guardian ID is not resumed exactly" "0" "$(grep -c "codex resume 'legacy_guardian'" "$RESTORE_LOG" || true)"
+kill_pane_children test-codex-picker true
+mv "${SAVED}.before-codex-policy" "$SAVED"
 
 # --- Test 3b: Restore skips panes with already-running assistants ---
 
@@ -1070,9 +1110,10 @@ rm -rf "$UNIT_STATE_DIR"
 # Reset STATE_DIR
 STATE_DIR="$TEST_STATE_DIR"
 
-# --- Codex: resume arg fallback ---
-assert_eq "Codex resume extraction" "ses_codex_789" "$(get_codex_session 99999 "codex resume ses_codex_789")"
-assert_eq "Codex resume with path" "ses_codex_789" "$(get_codex_session 99999 "/usr/bin/codex resume ses_codex_789")"
+# --- Codex: resume arg parsing does not bypass identity verification ---
+assert_eq "Codex resume arg parser" "ses_codex_789" "$(codex_resume_arg "codex resume ses_codex_789")"
+assert_eq "Codex unknown resume ID fails closed" "" "$(get_codex_session 99999 "codex resume ses_codex_789")"
+assert_contains "Codex unknown resume ID selects picker" "$(get_codex_session_record 99999 "/usr/bin/codex resume ses_codex_789")" "picker"
 assert_eq "Codex bare (no resume)" "" "$(get_codex_session 99999 "codex")"
 
 # --- Codex: state_*.sqlite thread DB (Method 3) ---
@@ -1135,28 +1176,29 @@ DBSETUP
 ORIG_HOME="$HOME"
 HOME="$STATEDB_TEST_DIR"
 
-# Should find the most recently updated active thread for the matching cwd
+# Two unarchived parents in one cwd are ambiguous; recency must not choose one.
 statedb_sid=$(get_codex_session $$ "codex" "/tmp/statedb-project")
-assert_eq "Codex state DB: finds active thread by cwd" "ses_statedb_active" "$statedb_sid"
+assert_eq "Codex state DB: same-cwd ambiguity fails closed" "" "$statedb_sid"
+assert_contains "Codex state DB: same-cwd ambiguity selects picker" "$(get_codex_session_record $$ "codex" "/tmp/statedb-project")" "picker"
 
 # Should NOT match a different cwd
 statedb_miss=$(get_codex_session $$ "codex" "/tmp/nonexistent")
 assert_eq "Codex state DB: no match for different cwd" "" "$statedb_miss"
 
-# Dedup: after claiming ses_statedb_active, next call should get ses_statedb_old
-USED_CODEX_SESSION_IDS=""
+# Once only one active parent remains, exact restore is safe and stable.
+python3 - "$STATEDB_TEST_DIR/.codex/state_5.sqlite" <<'PY'
+import sqlite3, sys
+con = sqlite3.connect(sys.argv[1])
+con.execute("update threads set archived = 1 where id = 'ses_statedb_old'")
+con.commit()
+con.close()
+PY
 statedb_first=$(get_codex_session $$ "codex" "/tmp/statedb-project")
-register_codex_session_id "$statedb_first"
 statedb_second=$(get_codex_session $$ "codex" "/tmp/statedb-project")
+assert_eq "Codex state DB: unique parent resolves exactly" "ses_statedb_active" "$statedb_first"
+assert_eq "Codex state DB: unique parent selection is stable" "$statedb_first" "$statedb_second"
 
-if [ -n "$statedb_first" ] && [ -n "$statedb_second" ] && [ "$statedb_first" != "$statedb_second" ]; then
-	pass "Codex state DB dedup: two calls get distinct sessions ($statedb_first vs $statedb_second)"
-else
-	fail "Codex state DB dedup: expected distinct sessions, got '$statedb_first' and '$statedb_second'"
-fi
-USED_CODEX_SESSION_IDS=""
-
-# Should prefer state DB (Method 3) over rollout JSONL (Method 4) when both exist
+# A verified unique DB parent remains authoritative when a legacy rollout exists.
 mkdir -p "$STATEDB_TEST_DIR/.codex/sessions/2026/04/23"
 cat >"$STATEDB_TEST_DIR/.codex/sessions/2026/04/23/rollout-statedb-test.jsonl" <<'ROLLOUT'
 {"timestamp":"2026-04-23T10:00:00.000Z","type":"session_meta","payload":{"id":"ses_rollout_loser","timestamp":"2026-04-23T10:00:00.000Z","cwd":"/tmp/statedb-project","originator":"codex_cli_rs","cli_version":"0.116.0"}}
@@ -1167,6 +1209,88 @@ assert_eq "Codex state DB takes priority over rollout JSONL" "ses_statedb_active
 
 HOME="$ORIG_HOME"
 rm -rf "$STATEDB_TEST_DIR"
+
+# --- Codex: process-owned rollout selection ---
+echo ""
+echo "=== Codex process-owned parent selection ==="
+echo ""
+
+OWNERSHIP_TEST_DIR=$(mktemp -d)
+mkdir -p "$OWNERSHIP_TEST_DIR/.codex/sessions/2026/08/03"
+OWNERSHIP_CWD="/tmp/codex-owned-shared-cwd"
+python3 - "$OWNERSHIP_TEST_DIR/.codex/state_5.sqlite" "$OWNERSHIP_TEST_DIR/.codex/sessions/2026/08/03" "$OWNERSHIP_CWD" <<'PY'
+import json, os, sqlite3, sys, time
+db, directory, cwd = sys.argv[1:]
+rows = [
+    ("parent_a", "cli", "user"),
+    ("child_a", '{"subagent":{"thread_spawn":{"parent_thread_id":"parent_a","depth":1}}}', "subagent"),
+    ("parent_b", "cli", "user"),
+    ("guardian_b", '{"subagent":{"other":"guardian"}}', "subagent"),
+    ("child_only", '{"subagent":{"thread_spawn":{"parent_thread_id":"parent_a","depth":1}}}', "subagent"),
+    ("nested_child", '{"subagent":{"thread_spawn":{"parent_thread_id":"child_a","depth":2}}}', "subagent"),
+]
+con = sqlite3.connect(db)
+con.execute("create table threads (id text primary key, rollout_path text not null, updated_at integer not null, source text not null, thread_source text, cwd text not null, archived integer not null default 0)")
+for sid, source, thread_source in rows:
+    path = os.path.join(directory, "rollout-" + sid + ".jsonl")
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(json.dumps({"type":"session_meta", "payload":{"id":sid, "cwd":cwd, "source":source, "thread_source":thread_source}}) + "\n")
+    con.execute("insert into threads values (?, ?, ?, ?, ?, ?, 0)", (sid, path, int(time.time()), source, thread_source, cwd))
+con.commit()
+con.close()
+PY
+
+ORIG_HOME="$HOME"
+HOME="$OWNERSHIP_TEST_DIR"
+owned_dir="$HOME/.codex/sessions/2026/08/03"
+python3 -c 'import sys,time; files=[open(p) for p in sys.argv[1:]]; time.sleep(300)' "$owned_dir/rollout-parent_a.jsonl" "$owned_dir/rollout-child_a.jsonl" &
+owned_parent_child_pid=$!
+python3 -c 'import sys,time; files=[open(p) for p in sys.argv[1:]]; time.sleep(300)' "$owned_dir/rollout-parent_b.jsonl" "$owned_dir/rollout-guardian_b.jsonl" &
+owned_parent_guardian_pid=$!
+python3 -c 'import sys,time; files=[open(p) for p in sys.argv[1:]]; time.sleep(300)' "$owned_dir/rollout-child_only.jsonl" &
+owned_child_pid=$!
+python3 -c 'import sys,time; files=[open(p) for p in sys.argv[1:]]; time.sleep(300)' "$owned_dir/rollout-guardian_b.jsonl" &
+owned_guardian_pid=$!
+python3 -c 'import sys,time; files=[open(p) for p in sys.argv[1:]]; time.sleep(300)' "$owned_dir/rollout-nested_child.jsonl" &
+owned_nested_pid=$!
+sleep 0.2
+
+CODEX_RAW_ROLLOUT_FILE=$(mktemp)
+CODEX_ROLLOUT_CACHE_FILE=$(mktemp)
+ownership_matches=$(printf 'pane-a\tcodex\t%s\tcodex\t%s\t/dev/null\npane-b\tcodex\t%s\tcodex\t%s\t/dev/null\npane-c\tcodex\t%s\tcodex resume child_only\t%s\t/dev/null\npane-d\tcodex\t%s\tcodex resume guardian_b\t%s\t/dev/null\npane-e\tcodex\t%s\tcodex resume nested_child\t%s\t/dev/null\n' \
+	"$owned_parent_child_pid" "$OWNERSHIP_CWD" "$owned_parent_guardian_pid" "$OWNERSHIP_CWD" "$owned_child_pid" "$OWNERSHIP_CWD" "$owned_guardian_pid" "$OWNERSHIP_CWD" "$owned_nested_pid" "$OWNERSHIP_CWD")
+codex_prepare_rollout_cache "$ownership_matches" "$CODEX_RAW_ROLLOUT_FILE" "$CODEX_ROLLOUT_CACHE_FILE"
+
+owned_parent_child=$(get_codex_session_record "$owned_parent_child_pid" "codex" "$OWNERSHIP_CWD" "pane-a")
+owned_parent_guardian=$(get_codex_session_record "$owned_parent_guardian_pid" "codex" "$OWNERSHIP_CWD" "pane-b")
+owned_child_exact=$(get_codex_session_record "$owned_child_pid" "codex resume child_only" "$OWNERSHIP_CWD" "pane-c")
+owned_child_picker=$(get_codex_session_record "$owned_child_pid" "codex" "$OWNERSHIP_CWD" "pane-c")
+owned_guardian_picker=$(get_codex_session_record "$owned_guardian_pid" "codex resume guardian_b" "$OWNERSHIP_CWD" "pane-d")
+owned_nested_picker=$(get_codex_session_record "$owned_nested_pid" "codex resume nested_child" "$OWNERSHIP_CWD" "pane-e")
+assert_contains "Codex parent beats newer child rollout" "$owned_parent_child" "parent_a"
+assert_contains "Codex parent+child resolves exact parent" "$owned_parent_child" "exact"
+assert_contains "Codex parent beats Guardian rollout" "$owned_parent_guardian" "parent_b"
+assert_contains "Two same-cwd processes retain distinct owned parents" "$owned_parent_child|$owned_parent_guardian" "parent_a"
+assert_contains "Two same-cwd processes retain second owned parent" "$owned_parent_child|$owned_parent_guardian" "parent_b"
+assert_contains "Explicit sole direct child remains exact" "$owned_child_exact" "child_only"
+assert_contains "Explicit sole direct child is marked subagent" "$owned_child_exact" "subagent"
+assert_contains "Bare sole child fails closed to picker" "$owned_child_picker" "picker"
+assert_contains "Explicit sole Guardian still fails closed to picker" "$owned_guardian_picker" "picker"
+assert_contains "Explicit nested subagent still fails closed to picker" "$owned_nested_picker" "picker"
+assert_eq "Codex descriptor snapshot has all seven owned rollouts" "7" "$(wc -l <"$CODEX_ROLLOUT_CACHE_FILE" | tr -d ' ')"
+assert_eq "macOS descriptor path batches lsof once" "1" "$(grep -c 'lsof -a -p' "$REPO_DIR/scripts/lib-codex-session.sh")"
+wrapper_parts=$(mktemp)
+wrapper_state=$(mktemp)
+wrapper_candidates=$(printf 'codex\03799999\037codex\ncodex\037%s\037codex\n' "$owned_parent_child_pid")
+resolve_pane_candidates "pane-wrapper" "$OWNERSHIP_CWD" "/dev/null" "$wrapper_candidates" $'\x1f' 0 "$wrapper_state" "$wrapper_parts"
+assert_eq "Codex launcher picker cannot mask process-owned child" "parent_a" "$(awk -F '\t' 'NR == 1 {print $3}' "$wrapper_parts")"
+rm -f "$wrapper_parts" "$wrapper_state"
+
+kill "$owned_parent_child_pid" "$owned_parent_guardian_pid" "$owned_child_pid" "$owned_guardian_pid" "$owned_nested_pid" 2>/dev/null || true
+wait "$owned_parent_child_pid" "$owned_parent_guardian_pid" "$owned_child_pid" "$owned_guardian_pid" "$owned_nested_pid" 2>/dev/null || true
+rm -f "$CODEX_RAW_ROLLOUT_FILE" "$CODEX_ROLLOUT_CACHE_FILE"
+HOME="$ORIG_HOME"
+rm -rf "$OWNERSHIP_TEST_DIR"
 
 # --- Codex: rollout session files (Method 4) ---
 # Codex ~0.100-0.117 wrote session metadata to ~/.codex/sessions/*/*.jsonl.
@@ -1192,32 +1316,19 @@ assert_eq "Codex rollout session file lookup by cwd" "ses_rollout_aaa" "$rollout
 rollout_sid_miss=$(get_codex_session $$ "codex" "/tmp/other-project")
 assert_eq "Codex rollout no match for different cwd" "" "$rollout_sid_miss"
 
-# --- Codex rollout: dedup across panes (USED_CODEX_SESSION_IDS) ---
-# When two panes share the same cwd, the second should get a different session.
+# --- Codex rollout: same-cwd ambiguity fails closed ---
 
 # Add a second rollout file for the same cwd
 cat >"$ROLLOUT_TEST_DIR/.codex/sessions/2026/03/24/rollout-2026-03-24T10-01-00-ses_rollout_bbb.jsonl" <<'ROLLOUT'
 {"timestamp":"2026-03-24T10:01:00.000Z","type":"session_meta","payload":{"id":"ses_rollout_bbb","timestamp":"2026-03-24T10:01:00.000Z","cwd":"/tmp/test-project","originator":"codex_cli_rs","cli_version":"0.116.0"}}
 ROLLOUT
 
-# First call picks one session
-USED_CODEX_SESSION_IDS=""
+# Neither call may guess between same-cwd rollouts without process ownership.
 dedup_first=$(get_codex_session $$ "codex" "/tmp/test-project")
-
-# Register it (simulating what emit_session does)
-if type register_codex_session_id >/dev/null 2>&1; then
-	register_codex_session_id "$dedup_first"
-fi
-
-# Second call should pick the OTHER session
 dedup_second=$(get_codex_session $$ "codex" "/tmp/test-project")
-
-# They must both be non-empty and different
-if [ -n "$dedup_first" ] && [ -n "$dedup_second" ] && [ "$dedup_first" != "$dedup_second" ]; then
-	pass "Codex rollout dedup: two panes same cwd get distinct sessions"
-else
-	fail "Codex rollout dedup: expected distinct sessions, got '$dedup_first' and '$dedup_second'"
-fi
+assert_eq "Codex rollout ambiguity: first lookup has no exact ID" "" "$dedup_first"
+assert_eq "Codex rollout ambiguity: second lookup has no exact ID" "" "$dedup_second"
+assert_contains "Codex rollout ambiguity selects picker" "$(get_codex_session_record $$ "codex" "/tmp/test-project")" "picker"
 
 HOME="$ORIG_HOME"
 rm -rf "$ROLLOUT_TEST_DIR"
@@ -1569,17 +1680,15 @@ assert_eq "State file session ID takes priority over --resume arg" "ses_hook_new
 rm -f "$PID_TEST_STATE_DIR/claude-${priority_child_pid}.json"
 kill_pane_children test-claude-priority true
 
-# --- Test 5c4: Codex resume arg fallback (chicken-and-egg) ---
-#
-# After restore, Codex is launched as `codex resume <session_id>`. Even
-# without a session-tags.jsonl entry, the save script should extract the
-# session ID from the process args.
+# --- Test 5c4: unverified Codex resume arg fails closed ---
 
 echo ""
-echo "=== Test 5c4: Codex resume arg fallback (chicken-and-egg) ==="
+echo "=== Test 5c4: unverified Codex resume arg fails closed ==="
 echo ""
 
-tmux new-session -d -s test-codex-resume -c /tmp
+CODEX_RESUME_CWD="/tmp/test-codex-resume-unverified"
+mkdir -p "$CODEX_RESUME_CWD"
+tmux new-session -d -s test-codex-resume -c "$CODEX_RESUME_CWD"
 tmux send-keys -t test-codex-resume "codex resume ses_codex_from_args" Enter
 codex_resume_shell_pid=$(tmux display-message -t test-codex-resume -p '#{pane_pid}')
 wait_for_child "$codex_resume_shell_pid" "codex" 10 >/dev/null || echo "WARN: codex child not found for resume test"
@@ -1591,9 +1700,12 @@ rm -f "$HOME/.tmux/resurrect/assistant-sessions.json"
 just save 2>&1
 
 codex_resume_sid=$(jq -r '.sessions[] | select(.pane | contains("test-codex-resume")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
-assert_eq "Codex resume arg fallback extracts session ID" "ses_codex_from_args" "$codex_resume_sid"
+codex_resume_mode=$(jq -r '.sessions[] | select(.pane | contains("test-codex-resume")) | .restore_mode' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
+assert_eq "Unverified Codex resume arg does not become exact ID" "" "$codex_resume_sid"
+assert_eq "Unverified Codex resume arg selects picker" "picker" "$codex_resume_mode"
 
 kill_pane_children test-codex-resume true
+rm -rf "$CODEX_RESUME_CWD"
 
 # --- Test 5c4b: Codex rollout session files (e2e) ---
 #
@@ -1639,7 +1751,7 @@ rm -rf "$ROLLOUT_CWD"
 # when two rollout files exist for that cwd.
 
 echo ""
-echo "=== Test 5c4c: Codex rollout dedup — two panes same cwd (e2e) ==="
+echo "=== Test 5c4c: Codex same-cwd ambiguity uses picker (e2e) ==="
 echo ""
 
 DEDUP_CWD="/tmp/test-codex-dedup"
@@ -1670,12 +1782,12 @@ just save 2>&1
 
 dedup_sid1=$(jq -r '.sessions[] | select(.pane | contains("test-codex-dedup1")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
 dedup_sid2=$(jq -r '.sessions[] | select(.pane | contains("test-codex-dedup2")) | .session_id' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
-
-if [ -n "$dedup_sid1" ] && [ -n "$dedup_sid2" ] && [ "$dedup_sid1" != "$dedup_sid2" ]; then
-	pass "Codex rollout dedup e2e: two panes same cwd get distinct sessions ($dedup_sid1 vs $dedup_sid2)"
-else
-	fail "Codex rollout dedup e2e: expected distinct sessions, got '$dedup_sid1' and '$dedup_sid2'"
-fi
+dedup_mode1=$(jq -r '.sessions[] | select(.pane | contains("test-codex-dedup1")) | .restore_mode' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
+dedup_mode2=$(jq -r '.sessions[] | select(.pane | contains("test-codex-dedup2")) | .restore_mode' "$HOME/.tmux/resurrect/assistant-sessions.json" 2>/dev/null)
+assert_eq "Codex ambiguity e2e: first pane has no guessed ID" "" "$dedup_sid1"
+assert_eq "Codex ambiguity e2e: second pane has no guessed ID" "" "$dedup_sid2"
+assert_eq "Codex ambiguity e2e: first pane uses picker" "picker" "$dedup_mode1"
+assert_eq "Codex ambiguity e2e: second pane uses picker" "picker" "$dedup_mode2"
 
 # Clean up
 rm -f "$HOME/.codex/sessions/2026/03/24/rollout-test-dedup-aaa.jsonl"
@@ -3303,7 +3415,7 @@ pi_enrich_log=$(cat "$RESTORE_LOG")
 assert_contains "Pi restore: session ID present" "$pi_enrich_log" "ses_pi_enrich"
 assert_contains "Pi restore: tool identified" "$pi_enrich_log" "restoring pi"
 assert_contains "Pi restore: cli_args preserved" "$pi_enrich_log" "'--model' 'sonnet'"
-assert_contains "Pi restore: uses command pi prefix" "$pi_enrich_log" "command pi"
+assert_contains "Pi restore: clears NO_COLOR" "$pi_enrich_log" "env -u NO_COLOR pi"
 
 kill_pane_children test-restore-pi true
 
@@ -3590,7 +3702,7 @@ assert_eq "Restore doesn't crash with bracket model name" "0" "$restore_bracket_
 assert_contains "Bracket model: session ID present" "$bracket_log" "ses_bracket_test"
 # cli_args should be posix_quote'd so brackets are safe
 assert_contains "Bracket model: model name quoted" "$bracket_log" "'claude-opus-4-6[1m]'"
-assert_contains "Bracket model: uses command claude" "$bracket_log" "command claude"
+assert_contains "Bracket model: clears NO_COLOR" "$bracket_log" "env -u NO_COLOR claude"
 
 kill_pane_children test-restore-bracket true
 

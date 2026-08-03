@@ -11,6 +11,7 @@ tmux-resurrect to save session IDs and restore them automatically.
 - `tmux-assistant-resurrect.tmux` -- TPM plugin entry point (sets tmux options, installs hooks)
 - `hooks/` -- Native hooks/plugins for each assistant tool (write session IDs to state files)
 - `scripts/lib-detect.sh` -- Shared library: `detect_tool()`, `pane_has_assistant()`, `posix_quote()`
+- `scripts/lib-codex-session.sh` -- Batched rollout ownership and parent/subagent classification for Codex
 - `scripts/save-assistant-sessions.sh` -- Resurrect post-save hook (process detection + session IDs + enriched fields via `extract_cli_args()`)
 - `scripts/restore-assistant-sessions.sh` -- Resurrect post-restore hook (resumes assistants with CLI flags + env vars)
 - `config/` -- tmux configuration snippet (used by `just install`, not TPM)
@@ -36,6 +37,10 @@ tmux-resurrect to save session IDs and restore them automatically.
   be a known shell, and (2) the pane must not already have a running assistant
   in its process tree. Both must pass. This prevents typing into TUIs or
   double-launching.
+- **Codex parent identity is fail-closed**: Never select a Codex thread by
+  same-cwd recency. Prefer process-owned parent rollout evidence. Preserve a
+  direct child only when it is the sole open rollout and the process explicitly
+  resumes it; otherwise save/restore with the native picker.
 - **Restore shell whitelist**: Guard 1 strips a leading `-` (login shells report
   as `-bash`, `-zsh`, etc.) then checks against a hardcoded whitelist: `bash`,
   `zsh`, `fish`, `sh`, `dash`, `ksh`, `tcsh`, `csh`, `nu`. If a user's shell
@@ -90,7 +95,9 @@ process args as a reliable fallback.
 - The sidecar JSON (`assistant-sessions.json`) entries include enriched fields:
   `model` (from state file or `--model` in args), `cli_args` (from `ps` args
   with binary name and session/resume args stripped), `env` (from state file).
-  All are optional for backward compatibility.
+  All are optional for backward compatibility. Codex additionally writes
+  `restore_mode` (`exact` or `picker`) and `thread_kind` (`parent`, `subagent`,
+  or `unknown`). Legacy Codex child/Guardian/unknown IDs fail closed to picker.
 - `extract_cli_args()` in `save-assistant-sessions.sh` strips per-tool session
   args: Claude `--resume[= ]<id>`, OpenCode `--session[= ]<id>` and `-s <id>`,
   Codex `resume <id>`, Pi `--session[= ]<id>`, Grok `--resume`/`-r`/`--session-id`/
@@ -113,7 +120,7 @@ changes after an upgrade, check the relevant source to confirm.
 | **OpenCode plugins run in-process** | `process.pid` in the plugin IS the opencode binary's PID; state file is keyed by this PID | OpenCode source: search for `await import(` in the plugin loader (approx. `packages/opencode/src/plugin/index.ts` -- path may move) |
 | **OpenCode Go binary overwrites process title** | `-s <id>` is NOT visible in `ps`; plugin state file or SQLite DB are the reliable sources | Run `ps -eo args=` on a running `opencode -s <id>` process |
 | **OpenCode SQLite DB** at `~/.local/share/opencode/opencode.db` | Fallback session ID extraction when plugin state file and args are unavailable; matches by cwd + most recent `time_updated` | Check DB schema: `sqlite3 ~/.local/share/opencode/opencode.db ".schema session"` |
-| **Codex writes `~/.codex/session-tags.jsonl`** | Primary session ID source for Codex (PID → session mapping) | Run Codex and check `cat ~/.codex/session-tags.jsonl` |
+| **Codex rollout ownership and thread source** | A process may hold parent, child, and Guardian rollouts simultaneously; exact restore must select the parent unless a sole direct child is explicit | Inspect `/proc/<pid>/fd` or `lsof -a -p <pid> -Fn`, then join rollout paths to `threads.rollout_path`, `thread_source`, and `source` in `~/.codex/state_*.sqlite` |
 | **Pi session files live in `~/.pi/agent/sessions/--<cwd>--/*.jsonl`** | Primary session ID source for Pi when `--session` is absent in args; save script reads header `type=id/cwd/timestamp` and scores candidates by process lifetime + mtime | Run Pi and inspect `~/.pi/agent/sessions`, verify first JSONL line has `{"type":"session","id":"..."}` |
 | **grok writes `~/.grok/active_sessions.json`** | Primary session ID source for Grok: an array of `{session_id, pid, cwd, opened_at}` for every live session, updated on open/close. `get_grok_session()` looks up by PID (works even for a bare `grok` with no args); `-r`/`--resume <uuid>` in process args is the fallback. `GROK_HOME` overrides the `~/.grok` base. | Run `grok`, then `cat ~/.grok/active_sessions.json`; confirm each running `grok` PID appears with its `session_id` |
 | **tmux-resurrect pane content archive** layout: `./pane_contents/pane-{session}:{window}.{pane}` inside `pane_contents.tar.gz` | `strip_assistant_pane_contents()` removes assistant pane files from this archive to prevent stale TUI flash on restore | tmux-resurrect source: `scripts/helpers.sh:pane_contents_file()` |

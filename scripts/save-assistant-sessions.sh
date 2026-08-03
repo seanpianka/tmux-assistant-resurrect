@@ -31,6 +31,8 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=lib-detect.sh
 source "$SCRIPT_DIR/lib-detect.sh"
+# shellcheck source=lib-codex-session.sh
+source "$SCRIPT_DIR/lib-codex-session.sh"
 
 STATE_DIR="${TMUX_ASSISTANT_RESURRECT_DIR:-${XDG_RUNTIME_DIR:-${TMPDIR:-/tmp}}/tmux-assistant-resurrect}"
 # Follow tmux-resurrect's own save-dir resolution (see resurrect_data_dir in
@@ -155,200 +157,21 @@ except Exception:
 	fi
 }
 
+
+# Backward-compatible scalar interface for external callers and unit tests.
+# The save pipeline uses get_codex_session_record() below so picker decisions
+# survive even though they intentionally have no exact session ID.
 get_codex_session() {
-	local child_pid="$1"
-	local args="$2"
-	local cwd="${3:-}"
+	local record us=$'\x1f'
+	record=$(codex_resolve_session "$1" "$2" "${3:-}" "${4:-}")
+	[ "${record#*"$us"}" = "$record" ] && return 0
+	case "${record#*"$us"}" in
+	exact"$us"*) printf '%s\n' "${record%%"$us"*}" ;;
+	esac
+}
 
-	# Method 1: session-tags.jsonl (written by Codex at runtime)
-	local tags_file="${HOME}/.codex/session-tags.jsonl"
-	if [ -f "$tags_file" ]; then
-		local sid
-		sid=$(grep "\"pid\": *${child_pid}[,}]" "$tags_file" 2>/dev/null |
-			tail -1 |
-			jq -r '.session // empty' 2>/dev/null || true)
-		if [ -n "$sid" ]; then
-			echo "$sid"
-			return
-		fi
-	fi
-
-	# Method 2: resume arg in process args (chicken-and-egg fallback)
-	# After restore, codex is launched as `codex resume <session_id>`.
-	local sid
-	sid=$(echo "$args" | sed -n "s/.*resume  *\([A-Za-z0-9_-]*\).*/\1/p")
-	if [ -n "$sid" ]; then
-		echo "$sid"
-		return
-	fi
-
-	# Method 3: Codex thread state DB (Codex >= ~0.118 persist state in
-	# SQLite: ~/.codex/state_*.sqlite, table `threads`, columns id/cwd/
-	# updated_at/archived).  This is the canonical current source — codex
-	# writes a `threads` row per session and bumps `updated_at` on every
-	# user turn.  A long-lived session that started days ago keeps its
-	# same `id` in this table even though no new rollout JSONL is ever
-	# written, which is exactly the case Method 4 misses.
-	#
-	# Strategy: among threads matching our process's cwd that are unarchived
-	# and have been updated during this process's lifetime, pick the most
-	# recently updated one that isn't already assigned to another pane.
-	#
-	# The DB file is versioned (state_5.sqlite, bumping on schema changes).
-	# We glob for state_*.sqlite inside python3 (avoids `ls -t` pipe and
-	# handles spaces in paths cleanly) and pick the newest by mtime.
-	if [ -n "$cwd" ] && command -v python3 >/dev/null 2>&1; then
-		local etimes
-		etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
-		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$HOME/.codex" "$cwd" "$etimes" <<'PY'
-import glob, os, sqlite3, sys, time
-
-codex_home = sys.argv[1]
-cwd = sys.argv[2]
-etimes_raw = sys.argv[3].strip()
-used = {sid for sid in os.environ.get("USED_CODEX_SESSION_IDS", "").split("\t") if sid}
-
-# Find the newest state_*.sqlite by mtime.
-dbs = sorted(glob.glob(os.path.join(codex_home, "state_*.sqlite")),
-             key=os.path.getmtime, reverse=True)
-if not dbs:
-    sys.exit(0)
-
-process_start = None
-if etimes_raw.isdigit():
-    process_start = time.time() - int(etimes_raw)
-
-# Open read-only so we never conflict with a running codex writer.
-try:
-    con = sqlite3.connect(f"file:{dbs[0]}?mode=ro", uri=True)
-except sqlite3.Error:
-    sys.exit(0)
-
-try:
-    cur = con.cursor()
-    cur.execute(
-        "SELECT id, updated_at FROM threads "
-        "WHERE cwd = ? AND archived = 0 "
-        "ORDER BY updated_at DESC",
-        (cwd,),
-    )
-    rows = cur.fetchall()
-finally:
-    con.close()
-
-# Prefer threads whose last update happened after the process started
-# (rules out stale threads in the same cwd). Fall back to most-recent
-# overall if nothing qualifies — covers the edge case where a session
-# was spawned but hasn't had any user turns yet.
-def pick(rows, require_after_start):
-    for sid, updated_at in rows:
-        if sid in used:
-            continue
-        if require_after_start and process_start is not None and updated_at < process_start:
-            continue
-        return sid
-    return None
-
-sid = pick(rows, require_after_start=True) or pick(rows, require_after_start=False)
-if sid:
-    print(sid)
-PY
-		)
-		if [ -n "$sid" ]; then
-			echo "$sid"
-			return
-		fi
-	fi
-
-	# Method 4: Codex rollout session files (Codex ~0.100-0.117 wrote
-	# these; newer versions have moved to SQLite, see Method 3).
-	# Releases in that window persisted session metadata under
-	# ~/.codex/sessions/*/*.jsonl and included a session_meta record
-	# with both id and cwd.
-	# We rank candidates by:
-	# - matching cwd
-	# - preferring session IDs not already assigned during this save
-	# - preferring sessions created before the current process start time
-	# - preferring sessions closest to the current process start time
-	# - preferring recently modified rollout files
-	local sessions_root="${HOME}/.codex/sessions"
-	if [ -n "$cwd" ] && [ -d "$sessions_root" ] && command -v python3 >/dev/null 2>&1; then
-		local etimes
-		etimes=$(ps -o etimes= -p "$child_pid" 2>/dev/null | tr -d ' ' || true)
-		sid=$(
-			USED_CODEX_SESSION_IDS="$USED_CODEX_SESSION_IDS" python3 - "$sessions_root" "$cwd" "$etimes" <<'PY'
-import datetime, json, os, sys, time
-
-sessions_root = sys.argv[1]
-cwd = sys.argv[2]
-etimes_raw = sys.argv[3].strip()
-used = {sid for sid in os.environ.get("USED_CODEX_SESSION_IDS", "").split("\t") if sid}
-
-process_start = None
-if etimes_raw.isdigit():
-    process_start = time.time() - int(etimes_raw)
-
-def parse_ts(value):
-    if not value:
-        return None
-    try:
-        return datetime.datetime.fromisoformat(value.replace("Z", "+00:00")).timestamp()
-    except Exception:
-        return None
-
-candidates = []
-for root, _, files in os.walk(sessions_root):
-    for name in files:
-        if not name.endswith(".jsonl"):
-            continue
-        path = os.path.join(root, name)
-        try:
-            with open(path, "r", encoding="utf-8") as f:
-                first = f.readline()
-            if not first:
-                continue
-            record = json.loads(first)
-            if record.get("type") != "session_meta":
-                continue
-            payload = record.get("payload") or {}
-            if payload.get("cwd") != cwd:
-                continue
-            sid = payload.get("id")
-            if not sid:
-                continue
-            candidates.append((sid, parse_ts(payload.get("timestamp")), os.path.getmtime(path)))
-        except Exception:
-            continue
-
-if not candidates:
-    sys.exit(0)
-
-def score(item):
-    sid, session_start, mtime = item
-    reused = sid in used
-    if process_start is None or session_start is None:
-        prior = 0
-        distance = float("inf")
-    else:
-        prior = 1 if session_start <= process_start + 120 else 0
-        distance = abs(process_start - session_start)
-    return (
-        0 if reused else 1,
-        prior,
-        -distance,
-        mtime,
-    )
-
-best = max(candidates, key=score)
-print(best[0])
-PY
-		)
-		if [ -n "$sid" ]; then
-			echo "$sid"
-			return
-		fi
-	fi
+get_codex_session_record() {
+	codex_resolve_session "$1" "$2" "${3:-}" "${4:-}"
 }
 
 _arg_value() {
@@ -1107,6 +930,31 @@ resolve_pane_candidates() {
 	local state_cache_file="$7"
 	local parts_file="$8"
 
+	# A pane can expose both a Node/npm Codex launcher and the native Codex
+	# process. Scan every Codex candidate first so a wrapper with no rollout FDs
+	# cannot commit a picker result before its process-owned child is examined.
+	local preferred_codex_pid="" preferred_codex_record="" scan_tool scan_pid scan_args scan_record scan_rest scan_owned_pid scan_sid scan_kind scan_cwd
+	while IFS="$us" read -r scan_tool scan_pid scan_args; do
+		[ "$scan_tool" = "codex" ] || continue
+		local has_owned_rollout=0
+		if [ -n "${CODEX_ROLLOUT_CACHE_FILE:-}" ] && [ -s "$CODEX_ROLLOUT_CACHE_FILE" ]; then
+			while IFS="$us" read -r scan_owned_pid scan_sid scan_kind scan_cwd; do
+				if [ "$scan_owned_pid" = "$scan_pid" ]; then
+					has_owned_rollout=1
+					break
+				fi
+			done <"$CODEX_ROLLOUT_CACHE_FILE"
+		fi
+		[ "$has_owned_rollout" -eq 1 ] || continue
+		scan_record=$(get_codex_session_record "$scan_pid" "$scan_args" "$pane_cwd" "$pane_target")
+		scan_rest="${scan_record#*"$us"}"
+		if [ "${scan_rest%%"$us"*}" = "exact" ]; then
+			preferred_codex_pid="$scan_pid"
+			preferred_codex_record="$scan_record"
+			break
+		fi
+	done <<<"$pane_candidates"
+
 	local resolved=0 first_tool="" first_pid=""
 	for pass in 1 2; do
 		[ "$resolved" -eq 1 ] && break
@@ -1135,7 +983,7 @@ resolve_pane_candidates() {
 				[ -z "$cached_env" ] && cached_env="null"
 			fi
 
-			local session_id=""
+			local session_id="" restore_mode="" thread_kind=""
 			case "$cand_tool" in
 			claude)
 				session_id="$cached_sid"
@@ -1146,13 +994,27 @@ resolve_pane_candidates() {
 				session_id="$cached_sid"
 				[ -z "$session_id" ] && session_id=$(get_opencode_session "$cand_pid" "$cand_args" "$pane_cwd" "$allow_opencode_db")
 				;;
-			codex) session_id=$(get_codex_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
+			codex)
+				local codex_record codex_rest
+				if [ -n "$preferred_codex_pid" ] && [ "$cand_pid" != "$preferred_codex_pid" ]; then
+					continue
+				fi
+				if [ "$cand_pid" = "$preferred_codex_pid" ]; then
+					codex_record="$preferred_codex_record"
+				else
+					codex_record=$(get_codex_session_record "$cand_pid" "$cand_args" "$pane_cwd" "$pane_target")
+				fi
+				session_id="${codex_record%%"$us"*}"
+				codex_rest="${codex_record#*"$us"}"
+				restore_mode="${codex_rest%%"$us"*}"
+				thread_kind="${codex_rest#*"$us"}"
+				;;
 			pi) session_id=$(get_pi_session "$cand_pid" "$cand_args" "$pane_cwd") ;;
 			omp) session_id=$(get_omp_session "$cand_pid" "$cand_args" "$pane_cwd" "$pane_tty") ;;
 			grok) session_id=$(get_grok_session "$cand_pid" "$cand_args") ;;
 			esac
 
-			if [ -n "$session_id" ]; then
+			if [ -n "$session_id" ] || { [ "$cand_tool" = "codex" ] && [ "$restore_mode" = "picker" ]; }; then
 				local cli_args model="" env_json="null" state_file=""
 				cli_args=$(extract_cli_args "$cand_tool" "$cand_args")
 				model="$cached_model"
@@ -1178,11 +1040,11 @@ resolve_pane_candidates() {
 				fi
 
 				# Write TSV for batch JSON conversion (replaces per-entry jq -n).
-				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
-					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" >>"$parts_file"
+				printf '%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n' \
+					"$pane_target" "$cand_tool" "$session_id" "$pane_cwd" "$cand_pid" "$model" "$cli_args" "$env_json" "$restore_mode" "$thread_kind" >>"$parts_file"
 
 				case "$cand_tool" in
-				codex) register_codex_session_id "$session_id" ;;
+				codex) [ -n "$session_id" ] && register_codex_session_id "$session_id" ;;
 				pi) register_pi_session_id "$session_id" ;;
 				omp) register_omp_session_id "$session_id" ;;
 				esac
@@ -1204,7 +1066,10 @@ main() {
 	PANE_FILE=$(mktemp)
 	PARTS_FILE=$(mktemp)
 	STATE_CACHE_FILE=$(mktemp)
-	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE"' EXIT INT TERM
+	CODEX_RAW_ROLLOUT_FILE=$(mktemp)
+	CODEX_ROLLOUT_CACHE_FILE=$(mktemp)
+	CODEX_PREVIOUS_SIDECAR="$OUTPUT_FILE"
+	trap 'rm -f "$PS_FILE" "$PANE_FILE" "$PARTS_FILE" "$STATE_CACHE_FILE" "$CODEX_RAW_ROLLOUT_FILE" "$CODEX_ROLLOUT_CACHE_FILE"' EXIT INT TERM
 
 	# Timestamp for the JSON output envelope
 	local SAVE_TS
@@ -1302,6 +1167,11 @@ main() {
 		}
 	' "$PANE_FILE" "$PS_FILE")
 
+	# Snapshot Codex rollout ownership once for all detected Codex processes.
+	# This is the primary identity source and prevents a newer same-cwd
+	# subagent or Guardian rollout from displacing its user-visible parent.
+	codex_prepare_rollout_cache "$MATCHES" "$CODEX_RAW_ROLLOUT_FILE" "$CODEX_ROLLOUT_CACHE_FILE"
+
 	rm -f "$PS_FILE" "$PANE_FILE"
 
 	# --- Pre-cache all state files in one jq call (requires jq 1.7+) ---
@@ -1389,7 +1259,7 @@ main() {
 		jq -Rs --arg ts "$SAVE_TS" '
 			split("\n") | map(select(length > 0) | split("\t") |
 			{pane:.[0], tool:.[1], session_id:.[2], cwd:.[3], pid:.[4], model:.[5], cli_args:.[6],
-			 env:(.[7] // "null" | try fromjson catch null)})
+			 env:(.[7] // "null" | try fromjson catch null), restore_mode:.[8], thread_kind:.[9]})
 			| {timestamp: $ts, sessions: .}
 		' "$PARTS_FILE" >"$OUTPUT_FILE"
 		count=$(jq '.sessions | length' "$OUTPUT_FILE")

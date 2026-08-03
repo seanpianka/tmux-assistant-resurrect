@@ -58,7 +58,7 @@ Session ID extraction uses tool-native mechanisms (infrastructure plumbing):
 |------|---------------|------------|------------|-------|
 | **Claude Code** | `SessionStart` hook state file (keyed by Claude PID) | `--resume` in process args | - | Claude overwrites its process title, so args fallback only works if args are visible |
 | **OpenCode** | `-s` / `--session` in process args | Plugin state file | SQLite DB query (`~/.local/share/opencode/opencode.db`) | Go binary overwrites process title; DB fallback matches most recent session by cwd |
-| **Codex CLI** | PID lookup in `~/.codex/session-tags.jsonl` | `resume` in process args | - | Codex runs via Node.js, so args are always visible in `ps` |
+| **Codex CLI** | Open rollout files owned by the Codex PID, joined to `~/.codex/state_*.sqlite` | Verified PID tag / explicit parent resume | Unique parent in cwd | Parent threads beat subagents and Guardians; ambiguity restores with the native `codex resume` picker |
 | **Pi** | Session header lookup in `~/.pi/agent/sessions/--<cwd>--/*.jsonl` | `--session` in process args | - | Session-file lookup is cwd-scoped and uses process-time scoring + dedup |
 | **Oh My Pi** | Terminal breadcrumb + session JSONL lookup (`$XDG_STATE_HOME/omp`, `$XDG_DATA_HOME/omp`) | `--resume` / `-r` in process args | `--session-dir` / `--profile` scoped lookup | Distinct `omp` tool; no hook/plugin required |
 | **Grok** | PID lookup in `~/.grok/active_sessions.json` | `-r` / `--resume <uuid>` in process args | - | Registry records every live session (including a bare `grok` with no args) keyed by PID, so sessions sharing a cwd never collide; no hook/plugin required |
@@ -146,6 +146,7 @@ hooks/
   opencode-session-track.js       # OpenCode plugin (tracks session ID + cleanup)
 scripts/
   lib-detect.sh                   # Shared library (detect_tool, pane_has_assistant, posix_quote)
+  lib-codex-session.sh            # Parent-safe Codex rollout ownership and thread classification
   save-assistant-sessions.sh      # Resurrect post-save hook (process detection + session IDs)
   restore-assistant-sessions.sh   # Resurrect post-restore hook (resumes assistants)
 test/
@@ -479,9 +480,14 @@ also cleans up its state file on process exit (SIGINT, SIGTERM).
 
 ### Codex CLI
 
-Codex natively writes PID-to-session mappings in
-`~/.codex/session-tags.jsonl`. The save script reads this file directly -- no
-additional hook is needed.
+Codex processes can own rollout files for both the user-visible thread and its
+internal subagents. The save hook snapshots open rollout descriptors once
+(`/proc/<pid>/fd` on Linux; one batched `lsof` call on macOS), joins them to
+`~/.codex/state_*.sqlite`, and selects the parent thread before considering
+fallbacks. A sole direct child remains exact only when the running command
+explicitly resumes that child. Ambiguous state is saved with
+`restore_mode: "picker"`, so restore launches bare `codex resume` instead of
+guessing. No Codex hook is required.
 
 ### Pi
 
@@ -504,19 +510,27 @@ matching binary names. Then extracts session IDs using tool-specific methods
 - **Environment** (`env`): from state file (captured by hooks/plugins)
 
 Writes everything to `assistant-sessions.json` in tmux-resurrect's save
-directory (see **Save location** above).
+directory (see **Save location** above). Codex entries also carry
+`restore_mode` (`exact` or `picker`) and `thread_kind` (`parent`, `subagent`, or
+`unknown`).
 
 ### Restore hook (`scripts/restore-assistant-sessions.sh`)
 
 Runs after each tmux-resurrect restore. Reads the sidecar JSON and reconstructs
 the full CLI invocation for each assistant: `<env_prefix> <binary> <cli_args>
 <resume_arg>`. Sends the command to each pane via `tmux send-keys`. If enriched
-fields are missing (old-format JSON), falls back to bare resume commands.
+fields are missing (old-format JSON), falls back to bare resume commands. For
+legacy Codex entries, only IDs verifiably classified as parents resume exactly;
+child, Guardian, unknown, and ambiguous IDs open the native picker.
 
 ## Limitations
 
 - **Running state is not preserved**: Assistants restart with their conversation
   history loaded, but any in-flight tool calls or pending operations are lost.
+- **Codex ambiguity is interactive**: If process ownership and persisted state
+  cannot prove a parent, restore opens the native Codex picker in that pane.
+  This deliberately requires one selection instead of resuming a non-editable
+  subagent chat.
 - **First save after install (chicken-and-egg)**: On initial install, no session
   IDs exist yet. Assistants must complete at least one session (triggering the
   hooks) before their IDs can be saved. For Codex/OpenCode (`-s`) and Pi
